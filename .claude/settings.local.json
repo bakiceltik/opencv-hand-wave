@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/bakiceltik/Documents/openvm/.venv/bin/python --version)",
+      "Bash(/Users/bakiceltik/Documents/openvm/.venv/bin/pip list *)"
+    ]
+  }
+}
