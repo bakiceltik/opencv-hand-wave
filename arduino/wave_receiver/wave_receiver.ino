@@ -117,6 +117,7 @@ void sagYumrukAt() {
 
   sagOmuz.detach();
   sagKol.detach();
+  while (Serial.available()) Serial.read();
 }
 
 void solYumrukAt() {
@@ -151,6 +152,7 @@ void solYumrukAt() {
 
   solOmuz.detach();
   solKol.detach();
+  while (Serial.available()) Serial.read();
 }
 
 void gelGelIsareti() {
@@ -190,6 +192,7 @@ void gelGelIsareti() {
 
   sagOmuz.detach();
   sagKol.detach();
+  while (Serial.available()) Serial.read();
 }
 
 void elSalla() {
@@ -246,6 +249,7 @@ void elSalla() {
   sagKol.detach();
   solOmuz.detach();
   solKol.detach();
+  while (Serial.available()) Serial.read();
 }
 
 void triggerWaveAction() {
