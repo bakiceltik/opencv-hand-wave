@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Detect a hand wave from the webcam (MediaPipe Hand Landmarker) and notify an Arduino.
+"""Detect a hand wave and track a face from the webcam, driving an Arduino.
 
-Only an actual hand triggers the detector: MediaPipe locates hand landmarks,
-so faces, bodies, and background motion are never candidates. A wave is an
-open palm moving left/right with enough amplitude and direction changes.
+Hand detection uses MediaPipe Hand Landmarker, so only a real hand can send
+the WAVE signal: faces, bodies, and background motion are never candidates.
+A wave is an open palm moving left/right with enough amplitude and direction
+changes.
+
+Face tracking uses MediaPipe Face Detector: the horizontal position of the
+largest face steers a pan servo. The script keeps the servo angle as state,
+nudges it toward the face in small steps, and sends `ANG:<degrees>` lines to
+the Arduino whenever the angle changes.
 """
 
 from __future__ import annotations
@@ -37,11 +43,17 @@ HAND_CONNECTIONS = (
     (0, 17),
 )
 
-MODEL_URL = (
+HAND_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
     "hand_landmarker/float16/latest/hand_landmarker.task"
 )
-DEFAULT_MODEL_PATH = pathlib.Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
+FACE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/"
+    "blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
+)
+MODELS_DIR = pathlib.Path(__file__).resolve().parent / "models"
+DEFAULT_HAND_MODEL_PATH = MODELS_DIR / "hand_landmarker.task"
+DEFAULT_FACE_MODEL_PATH = MODELS_DIR / "blaze_face_short_range.tflite"
 
 
 @dataclass
@@ -134,6 +146,62 @@ class WaveDetector:
         return direction_changes >= self.direction_changes_needed
 
 
+class PanController:
+    """Nudges a servo angle toward the face center in small, smooth steps."""
+
+    def __init__(
+        self,
+        *,
+        start_angle: float,
+        min_angle: float,
+        max_angle: float,
+        gain_deg: float,
+        max_step_deg: float,
+        deadband: float,
+        smoothing: float,
+        invert: bool,
+    ) -> None:
+        self.angle = float(start_angle)
+        self.min_angle = min_angle
+        self.max_angle = max_angle
+        self.gain_deg = gain_deg
+        self.max_step_deg = max_step_deg
+        self.deadband = deadband
+        self.smoothing = smoothing
+        self.invert = invert
+        self.smoothed_x: float | None = None
+        self.last_sent_angle: int | None = None
+
+    def update(self, face_center_x: float | None) -> int | None:
+        """Feed the normalized face center x (0..1) or None; return a new angle to send."""
+        if face_center_x is None:
+            self.smoothed_x = None
+            return None
+
+        if self.smoothed_x is None:
+            self.smoothed_x = face_center_x
+        else:
+            alpha = 1.0 - self.smoothing
+            self.smoothed_x = self.smoothing * self.smoothed_x + alpha * face_center_x
+
+        error = self.smoothed_x - 0.5
+        if abs(error) < self.deadband:
+            return None
+
+        step = error * self.gain_deg
+        step = max(-self.max_step_deg, min(self.max_step_deg, step))
+        if self.invert:
+            step = -step
+
+        self.angle = max(self.min_angle, min(self.max_angle, self.angle + step))
+        rounded = int(round(self.angle))
+        if rounded == self.last_sent_angle:
+            return None
+
+        self.last_sent_angle = rounded
+        return rounded
+
+
 class SerialSignalSender:
     def __init__(self, *, port: str | None, baudrate: int, dry_run: bool) -> None:
         self.port = port
@@ -143,17 +211,25 @@ class SerialSignalSender:
 
         if not dry_run and port is not None:
             self.connection = serial.Serial(port, baudrate=baudrate, timeout=1)
-            time.sleep(2.0)
+            print(f"[serial] connected to {port}, waiting for Arduino reset...")
+            time.sleep(4.0)
 
-    def send_wave(self) -> None:
-        message = "WAVE"
+    def send_line(self, message: str, *, quiet: bool = False) -> None:
         if self.dry_run or self.connection is None:
-            print(f"[dry-run] {message}")
+            if not quiet:
+                print(f"[dry-run] {message}")
             return
 
         self.connection.write(f"{message}\n".encode("utf-8"))
         self.connection.flush()
-        print(f"[serial] sent {message} to {self.port}")
+        if not quiet:
+            print(f"[serial] sent {message} to {self.port}")
+
+    def send_wave(self) -> None:
+        self.send_line("W")
+
+    def send_angle(self, angle: int) -> None:
+        self.send_line(f"ANG:{angle}", quiet=True)
 
     def close(self) -> None:
         if self.connection is not None and self.connection.is_open:
@@ -162,7 +238,10 @@ class SerialSignalSender:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Detect a hand wave from the webcam and send WAVE to an Arduino."
+        description=(
+            "Detect a hand wave (sends WAVE) and track the largest face "
+            "(sends ANG:<degrees> for a pan servo) over serial to an Arduino."
+        )
     )
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
     parser.add_argument(
@@ -170,7 +249,7 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Arduino serial device path, or 'auto' to guess one.",
     )
-    parser.add_argument("--baudrate", type=int, default=115200, help="Serial baudrate.")
+    parser.add_argument("--baudrate", type=int, default=9600, help="Serial baudrate.")
     parser.add_argument("--dry-run", action="store_true", help="Run without sending serial data.")
     parser.add_argument(
         "--no-preview",
@@ -178,10 +257,16 @@ def parse_args() -> argparse.Namespace:
         help="Disable the OpenCV preview window.",
     )
     parser.add_argument(
-        "--model-path",
+        "--hand-model-path",
         type=pathlib.Path,
-        default=DEFAULT_MODEL_PATH,
+        default=DEFAULT_HAND_MODEL_PATH,
         help="Path to the MediaPipe hand_landmarker.task model (downloaded if missing).",
+    )
+    parser.add_argument(
+        "--face-model-path",
+        type=pathlib.Path,
+        default=DEFAULT_FACE_MODEL_PATH,
+        help="Path to the MediaPipe blaze_face_short_range.tflite model (downloaded if missing).",
     )
     parser.add_argument(
         "--cooldown-seconds",
@@ -249,6 +334,70 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="MediaPipe minimum hand tracking confidence.",
     )
+    parser.add_argument(
+        "--no-face-track",
+        action="store_true",
+        help="Disable face tracking and servo angle output.",
+    )
+    parser.add_argument(
+        "--face-confidence",
+        type=float,
+        default=0.5,
+        help="MediaPipe minimum face detection confidence.",
+    )
+    parser.add_argument(
+        "--servo-start",
+        type=int,
+        default=90,
+        help="Initial servo angle in degrees.",
+    )
+    parser.add_argument(
+        "--servo-min",
+        type=int,
+        default=20,
+        help="Lowest servo angle the tracker may command.",
+    )
+    parser.add_argument(
+        "--servo-max",
+        type=int,
+        default=160,
+        help="Highest servo angle the tracker may command.",
+    )
+    parser.add_argument(
+        "--pan-gain",
+        type=float,
+        default=6.0,
+        help="Degrees of correction per frame for a face at the frame edge.",
+    )
+    parser.add_argument(
+        "--pan-max-step",
+        type=float,
+        default=2.5,
+        help="Maximum servo movement in degrees per frame (keeps motion small).",
+    )
+    parser.add_argument(
+        "--pan-deadband",
+        type=float,
+        default=0.06,
+        help="No servo movement while the face is within this fraction of frame center.",
+    )
+    parser.add_argument(
+        "--pan-smoothing",
+        type=float,
+        default=0.7,
+        help="Face position smoothing factor 0..1 (higher = smoother, slower).",
+    )
+    parser.add_argument(
+        "--invert-pan",
+        action="store_true",
+        help="Reverse the servo direction if the robot turns away from the face.",
+    )
+    parser.add_argument(
+        "--angle-interval",
+        type=float,
+        default=0.05,
+        help="Minimum seconds between ANG serial messages.",
+    )
     return parser.parse_args()
 
 
@@ -265,13 +414,13 @@ def guess_serial_port() -> str | None:
     return candidates[0] if candidates else None
 
 
-def ensure_model(model_path: pathlib.Path) -> pathlib.Path:
+def ensure_model(model_path: pathlib.Path, url: str) -> pathlib.Path:
     if model_path.exists():
         return model_path
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading hand landmarker model to {model_path} ...")
-    urllib.request.urlretrieve(MODEL_URL, model_path)
+    print(f"Downloading model to {model_path} ...")
+    urllib.request.urlretrieve(url, model_path)
     return model_path
 
 
@@ -299,6 +448,19 @@ def count_extended_fingers(landmarks) -> int:
     return extended
 
 
+def largest_face_bbox(detections) -> tuple[int, int, int, int] | None:
+    """Return (x, y, w, h) in pixels for the biggest detected face."""
+    best = None
+    best_area = 0.0
+    for detection in detections:
+        box = detection.bounding_box
+        area = float(box.width * box.height)
+        if area > best_area:
+            best_area = area
+            best = (box.origin_x, box.origin_y, box.width, box.height)
+    return best
+
+
 def draw_hand(frame, landmarks) -> None:
     height, width = frame.shape[:2]
     points = [(int(lm.x * width), int(lm.y * height)) for lm in landmarks]
@@ -321,7 +483,10 @@ def main() -> int:
         )
         return 2
 
-    model_path = ensure_model(args.model_path)
+    hand_model_path = ensure_model(args.hand_model_path, HAND_MODEL_URL)
+    face_model_path = None
+    if not args.no_face_track:
+        face_model_path = ensure_model(args.face_model_path, FACE_MODEL_URL)
 
     sender = SerialSignalSender(port=serial_port, baudrate=args.baudrate, dry_run=args.dry_run)
     detector = WaveDetector(
@@ -333,6 +498,16 @@ def main() -> int:
         min_wave_duration_seconds=args.min_wave_duration,
         max_gap_seconds=args.max_gap_seconds,
     )
+    pan = PanController(
+        start_angle=args.servo_start,
+        min_angle=args.servo_min,
+        max_angle=args.servo_max,
+        gain_deg=args.pan_gain,
+        max_step_deg=args.pan_max_step,
+        deadband=args.pan_deadband,
+        smoothing=args.pan_smoothing,
+        invert=args.invert_pan,
+    )
 
     capture = open_camera(args.camera_index)
     if not capture.isOpened():
@@ -340,17 +515,29 @@ def main() -> int:
         sender.close()
         return 1
 
-    landmarker_options = vision.HandLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-        running_mode=vision.RunningMode.VIDEO,
-        num_hands=1,
-        min_hand_detection_confidence=args.detection_confidence,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=args.tracking_confidence,
+    hand_landmarker = vision.HandLandmarker.create_from_options(
+        vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=str(hand_model_path)),
+            running_mode=vision.RunningMode.VIDEO,
+            num_hands=1,
+            min_hand_detection_confidence=args.detection_confidence,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=args.tracking_confidence,
+        )
     )
-    landmarker = vision.HandLandmarker.create_from_options(landmarker_options)
+    face_detector = None
+    if face_model_path is not None:
+        face_detector = vision.FaceDetector.create_from_options(
+            vision.FaceDetectorOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=str(face_model_path)),
+                running_mode=vision.RunningMode.VIDEO,
+                min_detection_confidence=args.face_confidence,
+            )
+        )
 
+    sender.send_angle(args.servo_start)
     last_trigger_at = 0.0
+    last_angle_sent_at = 0.0
     started_at = time.monotonic()
 
     try:
@@ -361,18 +548,27 @@ def main() -> int:
                 return 1
 
             frame = cv2.flip(frame, 1)
+            height, width = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             timestamp_ms = int((time.monotonic() - started_at) * 1000)
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+            hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+            face_result = (
+                face_detector.detect_for_video(mp_image, timestamp_ms)
+                if face_detector is not None
+                else None
+            )
 
             now = time.time()
+
+            # --- hand wave ---
             palm_center: tuple[float, float] | None = None
             hand_landmarks = None
             open_palm = False
 
-            if result.hand_landmarks:
-                hand_landmarks = result.hand_landmarks[0]
+            if hand_result.hand_landmarks:
+                hand_landmarks = hand_result.hand_landmarks[0]
                 open_palm = count_extended_fingers(hand_landmarks) >= args.min_extended_fingers
                 if open_palm:
                     palm = hand_landmarks[PALM_CENTER]
@@ -387,6 +583,22 @@ def main() -> int:
                 just_triggered = True
                 detector.reset()
 
+            # --- face pan ---
+            face_bbox = None
+            if face_result is not None:
+                face_bbox = largest_face_bbox(face_result.detections)
+
+            face_center_x = None
+            if face_bbox is not None:
+                fx, fy, fw, fh = face_bbox
+                face_center_x = (fx + fw / 2.0) / width
+
+            new_angle = pan.update(face_center_x)
+            if new_angle is not None and (now - last_angle_sent_at) >= args.angle_interval:
+                sender.send_angle(new_angle)
+                last_angle_sent_at = now
+
+            # --- status / preview ---
             if just_triggered:
                 status_text = "WAVE sent"
             elif detected:
@@ -395,17 +607,34 @@ def main() -> int:
                 status_text = "hand found, open your palm"
             elif hand_landmarks is not None:
                 status_text = "hand found, wave it"
+            elif face_bbox is not None:
+                status_text = "tracking face"
             else:
-                status_text = "watching for a hand"
+                status_text = "watching"
 
             if not args.no_preview:
                 if hand_landmarks is not None:
                     draw_hand(frame, hand_landmarks)
                 if palm_center is not None:
-                    height, width = frame.shape[:2]
                     cx = int(palm_center[0] * width)
                     cy = int(palm_center[1] * height)
                     cv2.circle(frame, (cx, cy), 8, (0, 0, 255), -1)
+                if face_bbox is not None:
+                    fx, fy, fw, fh = face_bbox
+                    cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (255, 120, 0), 2)
+
+                if face_detector is not None:
+                    angle_text = f"servo {pan.last_sent_angle or args.servo_start} deg"
+                    cv2.putText(
+                        frame,
+                        angle_text,
+                        (18, height - 18),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (255, 200, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
                 cv2.putText(
                     frame,
@@ -426,7 +655,9 @@ def main() -> int:
 
     finally:
         capture.release()
-        landmarker.close()
+        hand_landmarker.close()
+        if face_detector is not None:
+            face_detector.close()
         sender.close()
         cv2.destroyAllWindows()
 
