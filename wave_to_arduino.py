@@ -20,8 +20,10 @@ import glob
 import math
 import pathlib
 import sys
+import threading
 import time
 import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from typing import Deque
 
@@ -210,7 +212,17 @@ class SerialSignalSender:
         self.connection: serial.Serial | None = None
 
         if not dry_run and port is not None:
-            self.connection = serial.Serial(port, baudrate=baudrate, timeout=1)
+            try:
+                self.connection = serial.Serial(port, baudrate=baudrate, timeout=1)
+            except serial.SerialException as exc:
+                available_ports = find_serial_port_candidates()
+                available_text = ", ".join(available_ports) if available_ports else "none"
+                raise SystemExit(
+                    f"Could not open serial port {port}.\n"
+                    f"Available ports: {available_text}\n"
+                    "Tip: omit --serial-port to auto-detect the Arduino, and make sure "
+                    "Arduino IDE Serial Monitor is closed."
+                ) from exc
             print(f"[serial] connected to {port}, waiting for Arduino reset...")
             time.sleep(4.0)
 
@@ -236,6 +248,54 @@ class SerialSignalSender:
             self.connection.close()
 
 
+class LatestFrameCapture:
+    """Keeps only the newest frame so slow processing does not build visible lag."""
+
+    def __init__(self, capture: cv2.VideoCapture) -> None:
+        self.capture = capture
+        self.condition = threading.Condition()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.latest_frame = None
+        self.frame_id = 0
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _reader_loop(self) -> None:
+        while not self.stop_event.is_set():
+            ok, frame = self.capture.read()
+            if not ok:
+                time.sleep(0.05)
+                continue
+
+            with self.condition:
+                self.latest_frame = frame
+                self.frame_id += 1
+                self.condition.notify_all()
+
+    def read(self, *, after_frame_id: int, timeout: float) -> tuple[int, object | None]:
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while self.frame_id <= after_frame_id and not self.stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.condition.wait(timeout=remaining)
+
+            if self.frame_id <= after_frame_id or self.latest_frame is None:
+                return self.frame_id, None
+
+            return self.frame_id, self.latest_frame.copy()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        self.thread.join(timeout=1.0)
+        self.capture.release()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -244,6 +304,13 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
+    parser.add_argument(
+        "--camera-url",
+        help=(
+            "HTTP video stream URL, for example "
+            "http://192.168.1.50:81/stream for an ESP32-CAM CameraWebServer."
+        ),
+    )
     parser.add_argument(
         "--serial-port",
         default="auto",
@@ -256,6 +323,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable the OpenCV preview window.",
     )
+    mirror_group = parser.add_mutually_exclusive_group()
+    mirror_group.add_argument(
+        "--mirror",
+        dest="mirror",
+        action="store_true",
+        help="Mirror the video horizontally before detection.",
+    )
+    mirror_group.add_argument(
+        "--no-mirror",
+        dest="mirror",
+        action="store_false",
+        help="Keep the video orientation unchanged.",
+    )
+    parser.set_defaults(mirror=None)
     parser.add_argument(
         "--hand-model-path",
         type=pathlib.Path,
@@ -401,7 +482,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def guess_serial_port() -> str | None:
+def find_serial_port_candidates() -> list[str]:
     candidates: list[str] = []
     for pattern in (
         "/dev/cu.usbmodem*",
@@ -411,6 +492,11 @@ def guess_serial_port() -> str | None:
         "/dev/ttyUSB*",
     ):
         candidates.extend(sorted(glob.glob(pattern)))
+    return candidates
+
+
+def guess_serial_port() -> str | None:
+    candidates = find_serial_port_candidates()
     return candidates[0] if candidates else None
 
 
@@ -424,13 +510,48 @@ def ensure_model(model_path: pathlib.Path, url: str) -> pathlib.Path:
     return model_path
 
 
-def open_camera(index: int) -> cv2.VideoCapture:
+def normalize_camera_url(raw_url: str) -> str:
+    value = raw_url.strip()
+    if not value:
+        raise ValueError("Camera URL cannot be empty.")
+
+    if "://" not in value:
+        value = f"http://{value}"
+
+    parsed = urllib.parse.urlparse(value)
+    if not parsed.netloc:
+        raise ValueError(
+            "Camera URL must include a host, for example 192.168.1.50 or esp32cam.local."
+        )
+
+    if parsed.path not in ("", "/"):
+        return value
+
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("Camera URL host could not be parsed.")
+
+    port = parsed.port if parsed.port is not None else 81
+    netloc = host if port in (80, 443) and parsed.port is None else f"{host}:{port}"
+    return urllib.parse.urlunparse(
+        (parsed.scheme or "http", netloc, "/stream", "", "", "")
+    )
+
+
+def open_camera(index: int, camera_url: str | None) -> cv2.VideoCapture:
+    if camera_url is not None:
+        capture = cv2.VideoCapture(camera_url)
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return capture
+
     capture = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
     if capture.isOpened():
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return capture
 
     capture.release()
     capture = cv2.VideoCapture(index)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return capture
 
 
@@ -472,6 +593,14 @@ def draw_hand(frame, landmarks) -> None:
 
 def main() -> int:
     args = parse_args()
+    camera_source = None
+    if args.camera_url is not None:
+        try:
+            camera_source = normalize_camera_url(args.camera_url)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    mirror_frames = args.mirror if args.mirror is not None else camera_source is None
 
     serial_port = None if args.dry_run else (
         guess_serial_port() if args.serial_port == "auto" else args.serial_port
@@ -509,11 +638,22 @@ def main() -> int:
         invert=args.invert_pan,
     )
 
-    capture = open_camera(args.camera_index)
+    capture = open_camera(args.camera_index, camera_source)
     if not capture.isOpened():
-        print(f"Could not open camera index {args.camera_index}.", file=sys.stderr)
+        if camera_source is not None:
+            print(f"Could not open camera stream {camera_source}.", file=sys.stderr)
+        else:
+            print(f"Could not open camera index {args.camera_index}.", file=sys.stderr)
         sender.close()
         return 1
+
+    if camera_source is not None:
+        print(f"[camera] opened stream {camera_source}")
+    else:
+        print(f"[camera] opened local camera index {args.camera_index}")
+
+    frame_source = LatestFrameCapture(capture)
+    frame_source.start()
 
     hand_landmarker = vision.HandLandmarker.create_from_options(
         vision.HandLandmarkerOptions(
@@ -539,15 +679,17 @@ def main() -> int:
     last_trigger_at = 0.0
     last_angle_sent_at = 0.0
     started_at = time.monotonic()
+    last_frame_id = 0
 
     try:
         while True:
-            ok, frame = capture.read()
-            if not ok:
+            last_frame_id, frame = frame_source.read(after_frame_id=last_frame_id, timeout=5.0)
+            if frame is None:
                 print("Camera frame could not be read.", file=sys.stderr)
                 return 1
 
-            frame = cv2.flip(frame, 1)
+            if mirror_frames:
+                frame = cv2.flip(frame, 1)
             height, width = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -654,7 +796,7 @@ def main() -> int:
                     detector.reset()
 
     finally:
-        capture.release()
+        frame_source.close()
         hand_landmarker.close()
         if face_detector is not None:
             face_detector.close()

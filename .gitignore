@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 models/
+.arduino/
+.arduino-cli.yaml
+arduino/camera_web_server/
