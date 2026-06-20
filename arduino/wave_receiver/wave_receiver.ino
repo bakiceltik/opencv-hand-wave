@@ -8,9 +8,11 @@ const int OUTPUT_PIN = 7;
 const int GOVDE_SERVO_PIN = 3;
 const int DENGE_SERVO_PIN = 5;
 const int SOL_OMUZ_PIN = 6;
+const int ULTRASONIC_ECHO_PIN = 8;
 const int SAG_OMUZ_PIN = 9;
 const int SOL_KOL_PIN = 10;
 const int SAG_KOL_PIN = 11;
+const int ULTRASONIC_TRIG_PIN = 12;
 
 const int JOY_X_PIN = A0;
 const int JOY_SW_PIN = 2;
@@ -18,6 +20,12 @@ const int JOY_SW_PIN = 2;
 const int GOVDE_MIN_ANGLE = 20;
 const int GOVDE_MAX_ANGLE = 160;
 const int GOVDE_PUNCH_OFFSET = 40;
+const int MESAFE_GARD_CM = 40;
+const int MESAFE_YUMRUK_CM = 10;
+
+const unsigned long ULTRASONIC_TIMEOUT_US = 25000;
+const unsigned long ULTRASONIC_SAMPLE_INTERVAL_MS = 120;
+const unsigned long STATUS_PRINT_INTERVAL_MS = 300;
 
 Servo govdeServo;
 Servo sagOmuz;
@@ -55,6 +63,38 @@ int sagEsik = 700;
 
 bool joystickMerkezde = true;
 bool oncekiJoystickButon = HIGH;
+unsigned long sonUltrasonicOkumaMs = 0;
+unsigned long sonDurumYazdirmaMs = 0;
+bool yumrukHazir = true;
+bool sonrakiYumrukSol = true;
+
+enum MesafeDurumu {
+  MESAFE_BEKLE,
+  MESAFE_GARD,
+  MESAFE_YAKIN
+};
+
+MesafeDurumu mesafeDurumu = MESAFE_BEKLE;
+
+const char *mesafeDurumuAdi(MesafeDurumu durum) {
+  switch (durum) {
+    case MESAFE_BEKLE:
+      return "BEKLE";
+    case MESAFE_GARD:
+      return "GARD";
+    case MESAFE_YAKIN:
+      return "YAKIN";
+    default:
+      return "BILINMIYOR";
+  }
+}
+
+void writeDistanceStatus(long mesafeCm, MesafeDurumu durum) {
+  Serial.print("DIST_CM:");
+  Serial.print(mesafeCm);
+  Serial.print(" STATE:");
+  Serial.println(mesafeDurumuAdi(durum));
+}
 
 void pulseWaveOutputs() {
   digitalWrite(LED_PIN, HIGH);
@@ -83,6 +123,50 @@ void sagHazirPozisyon() {
 void solHazirPozisyon() {
   solOmuz.write(solOmuzHazir);
   solKol.write(solKolHazir);
+}
+
+void tumKollariAyir() {
+  sagOmuz.detach();
+  sagKol.detach();
+  solOmuz.detach();
+  solKol.detach();
+}
+
+void hazirPozisyonaDon() {
+  setGovdeAngle(govdeHazir);
+
+  sagOmuz.attach(SAG_OMUZ_PIN);
+  sagKol.attach(SAG_KOL_PIN);
+  solOmuz.attach(SOL_OMUZ_PIN);
+  solKol.attach(SOL_KOL_PIN);
+
+  sagHazirPozisyon();
+  solHazirPozisyon();
+  delay(250);
+
+  tumKollariAyir();
+}
+
+void gardPozisyonuAl() {
+  const int sagOmuzGard = 105;
+  const int sagKolGard = 85;
+  const int solOmuzGard = 65;
+  const int solKolGard = 135;
+
+  setGovdeAngle(govdeHazir);
+
+  sagOmuz.attach(SAG_OMUZ_PIN);
+  sagKol.attach(SAG_KOL_PIN);
+  solOmuz.attach(SOL_OMUZ_PIN);
+  solKol.attach(SOL_KOL_PIN);
+
+  sagOmuz.write(sagOmuzGard);
+  sagKol.write(sagKolGard);
+  solOmuz.write(solOmuzGard);
+  solKol.write(solKolGard);
+  delay(250);
+
+  tumKollariAyir();
 }
 
 void sagYumrukAt() {
@@ -257,6 +341,80 @@ void triggerWaveAction() {
   elSalla();
 }
 
+long mesafeOlcCm() {
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+  unsigned long sureUs = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, ULTRASONIC_TIMEOUT_US);
+  if (sureUs == 0) {
+    return -1;
+  }
+
+  return static_cast<long>(sureUs / 58);
+}
+
+void handleDistanceSensor() {
+  if (millis() - sonUltrasonicOkumaMs < ULTRASONIC_SAMPLE_INTERVAL_MS) {
+    return;
+  }
+
+  sonUltrasonicOkumaMs = millis();
+
+  long mesafeCm = mesafeOlcCm();
+  if (mesafeCm <= 0) {
+    return;
+  }
+
+  MesafeDurumu hedefDurum = MESAFE_YAKIN;
+  if (mesafeCm > MESAFE_GARD_CM) {
+    hedefDurum = MESAFE_BEKLE;
+  } else if (mesafeCm >= MESAFE_YUMRUK_CM) {
+    hedefDurum = MESAFE_GARD;
+  }
+
+  if (millis() - sonDurumYazdirmaMs >= STATUS_PRINT_INTERVAL_MS) {
+    sonDurumYazdirmaMs = millis();
+    writeDistanceStatus(mesafeCm, hedefDurum);
+  }
+
+  if (mesafeCm > MESAFE_GARD_CM) {
+    yumrukHazir = true;
+    if (mesafeDurumu != MESAFE_BEKLE) {
+      hazirPozisyonaDon();
+      mesafeDurumu = MESAFE_BEKLE;
+      Serial.println("DIST:BEKLE");
+    }
+    return;
+  }
+
+  if (mesafeCm >= MESAFE_YUMRUK_CM) {
+    yumrukHazir = true;
+    if (mesafeDurumu != MESAFE_GARD) {
+      gardPozisyonuAl();
+      mesafeDurumu = MESAFE_GARD;
+      Serial.println("DIST:GARD");
+    }
+    return;
+  }
+
+  if (yumrukHazir) {
+    yumrukHazir = false;
+    mesafeDurumu = MESAFE_YAKIN;
+    if (sonrakiYumrukSol) {
+      Serial.println("DIST:YUMRUK:SOL");
+      solYumrukAt();
+    } else {
+      Serial.println("DIST:YUMRUK:SAG");
+      sagYumrukAt();
+    }
+    sonrakiYumrukSol = !sonrakiYumrukSol;
+    gardPozisyonuAl();
+  }
+}
+
 void handleLine(const String &line) {
   Serial.print("RX:");
   Serial.println(line);
@@ -322,9 +480,12 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(OUTPUT_PIN, OUTPUT);
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
+  pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
 
   digitalWrite(LED_PIN, LOW);
   digitalWrite(OUTPUT_PIN, LOW);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
 
   dengeServo.attach(DENGE_SERVO_PIN);
   dengeServo.write(dengeAci);
@@ -361,7 +522,7 @@ void loop() {
   updateFeedbackOutputs();
 
   if (oncekiJoystickButon == HIGH && joystickButon == LOW) {
-    triggerWaveAction();
+    gelGelIsareti();
   }
 
   oncekiJoystickButon = joystickButon;
@@ -379,6 +540,8 @@ void loop() {
     joystickMerkezde = false;
     sagYumrukAt();
   }
+
+  handleDistanceSensor();
 
   delay(20);
 }

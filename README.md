@@ -35,6 +35,8 @@ The Arduino sketch in this repo now matches the shield/pin layout from the robot
 - `D9` → `sagOmuz`
 - `D10` → `solKol`
 - `D11` → `sagKol`
+- `D12` → HC-SR04 `TRIG`
+- `D8` → HC-SR04 `ECHO`
 - `A0` → joystick `X`
 - `D2` → joystick button `SW`
 - `D7` → optional feedback output that goes high during `WAVE`
@@ -64,9 +66,21 @@ Optional manual serial commands:
 
 On boot the robot moves to its ready pose, keeps `dengeServo` on `D5` at the configured balance angle, and keeps joystick control active:
 
-- joystick button → `elSalla()`
+- joystick button → `gelGelIsareti()`
 - joystick left → `solYumrukAt()`
 - joystick right → `sagYumrukAt()`
+
+HC-SR04 distance behavior in the current sketch:
+
+- farther than `40 cm` → ready / waiting pose
+- between `20 cm` and `40 cm` → guard pose
+- closer than `20 cm` → one punch, alternating left and right each time, then returns to guard until the target moves away again
+
+To watch the sensor live in Arduino IDE Serial Monitor, set baud to `9600`. The sketch prints lines like:
+
+- `DIST_CM:48 STATE:BEKLE`
+- `DIST_CM:27 STATE:GARD`
+- `DIST:YUMRUK`
 
 ## Find your Arduino serial port
 
