@@ -22,6 +22,7 @@ import pathlib
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 from dataclasses import dataclass
@@ -248,6 +249,42 @@ class SerialSignalSender:
             self.connection.close()
 
 
+class HttpCommandSender:
+    """Sends robot commands over WiFi to the ESP32-CAM's /cmd endpoint, which the
+    ESP32-CAM forwards over its wired UART link to the Arduino -- no USB cable
+    between the Arduino and this PC needed."""
+
+    def __init__(self, *, base_url: str, dry_run: bool, timeout: float = 1.0) -> None:
+        self.base_url = base_url
+        self.dry_run = dry_run
+        self.timeout = timeout
+
+    def send_line(self, message: str, *, quiet: bool = False) -> None:
+        if self.dry_run:
+            if not quiet:
+                print(f"[dry-run] {message}")
+            return
+
+        url = f"{self.base_url}/cmd?v={urllib.parse.quote(message)}"
+        try:
+            urllib.request.urlopen(url, timeout=self.timeout).read()
+        except (urllib.error.URLError, OSError) as exc:
+            print(f"[http] failed to send {message!r}: {exc}", file=sys.stderr)
+            return
+
+        if not quiet:
+            print(f"[http] sent {message} to {self.base_url}")
+
+    def send_wave(self) -> None:
+        self.send_line("W")
+
+    def send_angle(self, angle: int) -> None:
+        self.send_line(f"ANG:{angle}", quiet=True)
+
+    def close(self) -> None:
+        pass
+
+
 class LatestFrameCapture:
     """Keeps only the newest frame so slow processing does not build visible lag."""
 
@@ -316,7 +353,17 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Arduino serial device path, or 'auto' to guess one.",
     )
-    parser.add_argument("--baudrate", type=int, default=9600, help="Serial baudrate.")
+    parser.add_argument("--baudrate", type=int, default=9600, help="Serial baudrate (only used without --camera-url).")
+    parser.add_argument(
+        "--robot-port",
+        type=int,
+        default=80,
+        help=(
+            "ESP32-CAM HTTP port serving /cmd (camera_httpd in camera_web_server.ino). "
+            "Only used with --camera-url: commands go over WiFi to the ESP32-CAM, which "
+            "relays them over its wired UART link to the Arduino."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Run without sending serial data.")
     parser.add_argument(
         "--no-preview",
@@ -538,6 +585,23 @@ def normalize_camera_url(raw_url: str) -> str:
     )
 
 
+def derive_control_url(raw_url: str, port: int) -> str:
+    """Build the ESP32-CAM's main HTTP server URL (serves /cmd, /capture, ...) from the
+    same host the user gave for the video stream. Defaults to port 80, the camera_httpd
+    port in camera_web_server.ino -- the :81 stream server is a separate one."""
+    value = raw_url.strip()
+    if "://" not in value:
+        value = f"http://{value}"
+
+    parsed = urllib.parse.urlparse(value)
+    host = parsed.hostname
+    if not host:
+        raise ValueError("Camera URL host could not be parsed.")
+
+    netloc = host if port == 80 else f"{host}:{port}"
+    return urllib.parse.urlunparse((parsed.scheme or "http", netloc, "", "", "", ""))
+
+
 def open_camera(index: int, camera_url: str | None) -> cv2.VideoCapture:
     if camera_url is not None:
         capture = cv2.VideoCapture(camera_url)
@@ -602,22 +666,31 @@ def main() -> int:
             return 2
     mirror_frames = args.mirror if args.mirror is not None else camera_source is None
 
-    serial_port = None if args.dry_run else (
-        guess_serial_port() if args.serial_port == "auto" else args.serial_port
-    )
-    if not args.dry_run and serial_port is None:
-        print(
-            "No Arduino-like serial port found. Connect the board or pass --serial-port /dev/...",
-            file=sys.stderr,
-        )
-        return 2
-
     hand_model_path = ensure_model(args.hand_model_path, HAND_MODEL_URL)
     face_model_path = None
     if not args.no_face_track:
         face_model_path = ensure_model(args.face_model_path, FACE_MODEL_URL)
 
-    sender = SerialSignalSender(port=serial_port, baudrate=args.baudrate, dry_run=args.dry_run)
+    if args.camera_url is not None:
+        # ESP32-CAM is the video source, so it's also the wired bridge to the Arduino:
+        # commands go out over WiFi to its /cmd endpoint instead of a USB cable.
+        try:
+            control_url = derive_control_url(args.camera_url, args.robot_port)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        sender = HttpCommandSender(base_url=control_url, dry_run=args.dry_run)
+    else:
+        serial_port = None if args.dry_run else (
+            guess_serial_port() if args.serial_port == "auto" else args.serial_port
+        )
+        if not args.dry_run and serial_port is None:
+            print(
+                "No Arduino-like serial port found. Connect the board or pass --serial-port /dev/...",
+                file=sys.stderr,
+            )
+            return 2
+        sender = SerialSignalSender(port=serial_port, baudrate=args.baudrate, dry_run=args.dry_run)
     detector = WaveDetector(
         min_amplitude=args.wave_amplitude,
         min_direction_step=args.direction_step,

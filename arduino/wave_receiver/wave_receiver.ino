@@ -1,6 +1,14 @@
 #include <Servo.h>
+#include <SoftwareSerial.h>
 
 const int SERIAL_BAUDRATE = 9600;
+
+// Wired link to the ESP32-CAM's hardware UART0 (GPIO1/TX -> ESP_RX_PIN, GPIO3/RX -> ESP_TX_PIN),
+// so commands (WAVE, ANG:.., ...) arrive over this wire instead of USB from a PC.
+// Baud must match Serial.begin() in camera_web_server.ino.
+const int ESP_RX_PIN = 4;
+const int ESP_TX_PIN = A2;
+const int ESP_SERIAL_BAUDRATE = 9600;
 
 const int LED_PIN = LED_BUILTIN;
 const int OUTPUT_PIN = 7;
@@ -34,9 +42,17 @@ Servo solOmuz;
 Servo solKol;
 Servo dengeServo;
 
-String incomingLine;
+SoftwareSerial espSerial(ESP_RX_PIN, ESP_TX_PIN);
+
+struct LineReader {
+  String buffer;
+  bool discardUntilNewline = false;
+};
+
+LineReader usbReader;
+LineReader espReader;
+
 unsigned long ledUntil = 0;
-bool discardUntilNewline = false;
 
 int dengeAci = 140;
 
@@ -44,12 +60,12 @@ int govdeHazir = 90;
 int currentGovdeAngle = 90;
 
 int sagOmuzHazir = 50;
-int sagKolHazir = 140;
+int sagKolHazir = 50;
 int sagOmuzYumruk = 145;
 int sagKolYumruk = 50;
 
 int solOmuzHazir = 120;
-int solKolHazir = 80;
+int solKolHazir = 170;
 int solOmuzYumruk = 30;
 int solKolYumruk = 170;
 
@@ -142,16 +158,12 @@ void hazirPozisyonaDon() {
 
   sagHazirPozisyon();
   solHazirPozisyon();
-  delay(250);
-
-  tumKollariAyir();
+  delay(400);
 }
 
 void gardPozisyonuAl() {
-  const int sagOmuzGard = 105;
-  const int sagKolGard = 85;
-  const int solOmuzGard = 65;
-  const int solKolGard = 135;
+  const int sagKolGard = 130;
+  const int solKolGard = 80;
 
   setGovdeAngle(govdeHazir);
 
@@ -160,9 +172,9 @@ void gardPozisyonuAl() {
   solOmuz.attach(SOL_OMUZ_PIN);
   solKol.attach(SOL_KOL_PIN);
 
-  sagOmuz.write(sagOmuzGard);
+  sagOmuz.write(sagOmuzHazir);
   sagKol.write(sagKolGard);
-  solOmuz.write(solOmuzGard);
+  solOmuz.write(solOmuzHazir);
   solKol.write(solKolGard);
   delay(250);
 
@@ -445,37 +457,47 @@ void handleLine(const String &line) {
   }
 }
 
-void readSerialCommands() {
-  while (Serial.available() > 0) {
-    char ch = static_cast<char>(Serial.read());
+// allowBareWShortcut is only for the USB link, where a human types a single 'W' + Enter
+// in the Serial Monitor. The ESP32-CAM link only ever sends full, newline-terminated
+// lines, and its own WiFi/camera boot logs ("WiFi connecting...") can start with 'W' --
+// so that link must always go through the full-line match in handleLine() instead.
+void readCommandsFrom(Stream &stream, LineReader &reader, bool allowBareWShortcut) {
+  while (stream.available() > 0) {
+    char ch = static_cast<char>(stream.read());
 
-    if (discardUntilNewline) {
+    if (reader.discardUntilNewline) {
       if (ch == '\n' || ch == '\r') {
-        discardUntilNewline = false;
+        reader.discardUntilNewline = false;
       }
       continue;
     }
 
-    if (incomingLine.length() == 0 && (ch == 'W' || ch == 'w')) {
+    if (allowBareWShortcut && reader.buffer.length() == 0 && (ch == 'W' || ch == 'w')) {
       Serial.println("RX:W");
       triggerWaveAction();
-      discardUntilNewline = true;
+      reader.discardUntilNewline = true;
       continue;
     }
 
     if (ch == '\n' || ch == '\r') {
-      if (incomingLine.length() > 0) {
-        handleLine(incomingLine);
-        incomingLine = "";
+      if (reader.buffer.length() > 0) {
+        handleLine(reader.buffer);
+        reader.buffer = "";
       }
-    } else if (incomingLine.length() < 31) {
-      incomingLine += ch;
+    } else if (reader.buffer.length() < 31) {
+      reader.buffer += ch;
     }
   }
 }
 
+void readSerialCommands() {
+  readCommandsFrom(Serial, usbReader, true);
+  readCommandsFrom(espSerial, espReader, false);
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUDRATE);
+  espSerial.begin(ESP_SERIAL_BAUDRATE);
 
   pinMode(LED_PIN, OUTPUT);
   pinMode(OUTPUT_PIN, OUTPUT);

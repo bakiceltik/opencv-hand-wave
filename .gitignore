@@ -4,4 +4,3 @@ __pycache__/
 models/
 .arduino/
 .arduino-cli.yaml
-arduino/camera_web_server/
