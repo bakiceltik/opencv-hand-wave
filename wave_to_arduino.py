@@ -241,6 +241,15 @@ class SerialSignalSender:
     def send_wave(self) -> None:
         self.send_line("W")
 
+    def send_middle_finger(self) -> None:
+        self.send_line("MIDDLE_FINGER")
+
+    def send_shoulder_up(self) -> None:
+        self.send_line("SHOULDER_UP")
+
+    def send_shoulder_down(self) -> None:
+        self.send_line("SHOULDER_DOWN")
+
     def send_angle(self, angle: int) -> None:
         self.send_line(f"ANG:{angle}", quiet=True)
 
@@ -277,6 +286,15 @@ class HttpCommandSender:
 
     def send_wave(self) -> None:
         self.send_line("W")
+
+    def send_middle_finger(self) -> None:
+        self.send_line("MIDDLE_FINGER")
+
+    def send_shoulder_up(self) -> None:
+        self.send_line("SHOULDER_UP")
+
+    def send_shoulder_down(self) -> None:
+        self.send_line("SHOULDER_DOWN")
 
     def send_angle(self, angle: int) -> None:
         self.send_line(f"ANG:{angle}", quiet=True)
@@ -443,6 +461,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.35,
         help="Reset the tracked motion if the hand disappears longer than this.",
+    )
+    parser.add_argument(
+        "--middle-finger-cooldown-seconds",
+        type=float,
+        default=3.0,
+        help="Minimum delay between MIDDLE_FINGER signals (triggers the shoulders forward/back move).",
     )
     parser.add_argument(
         "--min-extended-fingers",
@@ -619,18 +643,41 @@ def open_camera(index: int, camera_url: str | None) -> cv2.VideoCapture:
     return capture
 
 
+def finger_extended(landmarks, tip_index: int, pip_index: int, wrist) -> bool:
+    """A finger is extended if its tip is farther from the wrist than its PIP joint."""
+    tip = landmarks[tip_index]
+    pip = landmarks[pip_index]
+    tip_distance = math.hypot(tip.x - wrist.x, tip.y - wrist.y)
+    pip_distance = math.hypot(pip.x - wrist.x, pip.y - wrist.y)
+    return tip_distance > pip_distance
+
+
 def count_extended_fingers(landmarks) -> int:
     """Count non-thumb fingers whose tip is farther from the wrist than its PIP joint."""
     wrist = landmarks[WRIST]
-    extended = 0
-    for tip_index, pip_index in FINGER_TIP_PIP_PAIRS:
-        tip = landmarks[tip_index]
-        pip = landmarks[pip_index]
-        tip_distance = math.hypot(tip.x - wrist.x, tip.y - wrist.y)
-        pip_distance = math.hypot(pip.x - wrist.x, pip.y - wrist.y)
-        if tip_distance > pip_distance:
-            extended += 1
-    return extended
+    return sum(
+        finger_extended(landmarks, tip_index, pip_index, wrist)
+        for tip_index, pip_index in FINGER_TIP_PIP_PAIRS
+    )
+
+
+def is_fist(landmarks) -> bool:
+    """All non-thumb fingers folded."""
+    return count_extended_fingers(landmarks) == 0
+
+
+def is_middle_finger_gesture(landmarks) -> bool:
+    """Only the middle finger extended, index/ring/pinky folded."""
+    wrist = landmarks[WRIST]
+    (index_tip, index_pip), (middle_tip, middle_pip), (ring_tip, ring_pip), (pinky_tip, pinky_pip) = (
+        FINGER_TIP_PIP_PAIRS
+    )
+    return (
+        finger_extended(landmarks, middle_tip, middle_pip, wrist)
+        and not finger_extended(landmarks, index_tip, index_pip, wrist)
+        and not finger_extended(landmarks, ring_tip, ring_pip, wrist)
+        and not finger_extended(landmarks, pinky_tip, pinky_pip, wrist)
+    )
 
 
 def largest_face_bbox(detections) -> tuple[int, int, int, int] | None:
@@ -750,6 +797,9 @@ def main() -> int:
 
     sender.send_angle(args.servo_start)
     last_trigger_at = 0.0
+    last_middle_finger_at = 0.0
+    middle_finger_armed = True
+    fist_active = False
     last_angle_sent_at = 0.0
     started_at = time.monotonic()
     last_frame_id = 0
@@ -798,6 +848,32 @@ def main() -> int:
                 just_triggered = True
                 detector.reset()
 
+            # --- middle finger gesture ---
+            middle_finger_gesture = (
+                hand_landmarks is not None and is_middle_finger_gesture(hand_landmarks)
+            )
+            just_triggered_middle_finger = False
+
+            if not middle_finger_gesture:
+                middle_finger_armed = True
+            elif middle_finger_armed and (
+                now - last_middle_finger_at
+            ) >= args.middle_finger_cooldown_seconds:
+                sender.send_middle_finger()
+                last_middle_finger_at = now
+                middle_finger_armed = False
+                just_triggered_middle_finger = True
+                detector.reset()
+
+            # --- fist -> raise/lower right shoulder ---
+            fist_detected = hand_landmarks is not None and is_fist(hand_landmarks)
+            if fist_detected and not fist_active:
+                sender.send_shoulder_up()
+                fist_active = True
+            elif not fist_detected and fist_active:
+                sender.send_shoulder_down()
+                fist_active = False
+
             # --- face pan ---
             face_bbox = None
             if face_result is not None:
@@ -814,7 +890,13 @@ def main() -> int:
                 last_angle_sent_at = now
 
             # --- status / preview ---
-            if just_triggered:
+            if just_triggered_middle_finger:
+                status_text = "middle finger detected, shoulders moving"
+            elif middle_finger_gesture:
+                status_text = "middle finger gesture held"
+            elif fist_active:
+                status_text = "fist held, right shoulder up"
+            elif just_triggered:
                 status_text = "WAVE sent"
             elif detected:
                 status_text = "wave detected"

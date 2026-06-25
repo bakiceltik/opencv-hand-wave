@@ -20,7 +20,8 @@ void setup() {
   // 9600 baud so this UART (GPIO1/TX, GPIO3/RX) doubles as the wired link to the
   // Arduino's SoftwareSerial pins -- must match espSerial.begin() in wave_receiver.ino.
   Serial.begin(9600);
-  Serial.setDebugOutput(true);
+  Serial.setDebugOutput(false);
+  esp_log_level_set("*", ESP_LOG_NONE);
   Serial.println();
 
   camera_config_t config;
