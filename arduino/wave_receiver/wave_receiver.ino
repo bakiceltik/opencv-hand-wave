@@ -30,6 +30,7 @@ const int GOVDE_MAX_ANGLE = 160;
 const int GOVDE_PUNCH_OFFSET = 40;
 const int MESAFE_GARD_CM = 40;
 const int MESAFE_YUMRUK_CM = 10;
+const int MESAFE_GARD_HYSTERESIS_CM = 5;
 
 const unsigned long ULTRASONIC_TIMEOUT_US = 25000;
 const unsigned long ULTRASONIC_SAMPLE_INTERVAL_MS = 120;
@@ -392,7 +393,11 @@ void handleDistanceSensor() {
     writeDistanceStatus(mesafeCm, hedefDurum);
   }
 
-  if (mesafeCm > MESAFE_GARD_CM) {
+  bool bekleEsigiAsildi = (mesafeDurumu == MESAFE_BEKLE)
+      ? (mesafeCm > MESAFE_GARD_CM - MESAFE_GARD_HYSTERESIS_CM)
+      : (mesafeCm > MESAFE_GARD_CM + MESAFE_GARD_HYSTERESIS_CM);
+
+  if (bekleEsigiAsildi) {
     yumrukHazir = true;
     if (mesafeDurumu != MESAFE_BEKLE) {
       hazirPozisyonaDon();
